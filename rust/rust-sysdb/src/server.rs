@@ -54,6 +54,7 @@ use tokio::{
     signal::unix::{signal, SignalKind},
 };
 use tonic::{transport::Server, Request, Response, Status};
+use tracing::instrument;
 
 pub struct SysdbService {
     port: u16,
@@ -681,7 +682,7 @@ impl SysDb for SysdbService {
         .retry(backoff)
         .when(|e: &SysDbError| {
             if matches!(e, SysDbError::CollectionEntryIsStale) {
-                tracing::info!(
+                tracing::warn!(
                     "Collection entry is stale, retrying flush collection compaction for collection_id: {}",
                     collection_id
                 );
@@ -752,6 +753,7 @@ impl SysDb for SysdbService {
 
 impl SysdbService {
     /// Create a new version file in object storage
+    #[instrument(skip(self, storage, segments), level = "info", fields(collection_id = %collection.collection_id))]
     async fn create_new_version_file(
         &self,
         storage: &Storage,
