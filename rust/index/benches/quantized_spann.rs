@@ -29,6 +29,7 @@ use datasets::arxiv::Arxiv;
 use datasets::dbpedia::DbPedia;
 use datasets::msmarco::MsMarco;
 use datasets::sec::Sec;
+use datasets::wikipedia::Wikipedia;
 use datasets::{format_count, recall_at_k, Dataset, DatasetType, MetricType, Query};
 
 // =============================================================================
@@ -78,8 +79,10 @@ struct CheckpointResult {
     index_time: Duration,
     commit_time: Duration,
     num_queries: usize,
-    recall_10: f64,
-    recall_100: f64,
+    recall_10_np64: f64,
+    recall_100_np64: f64,
+    recall_10_np128: f64,
+    recall_100_np128: f64,
 }
 
 // =============================================================================
@@ -101,11 +104,6 @@ fn spann_config() -> SpannIndexConfig {
 
         // Commit-time parameters
         center_drift_threshold: Some(0.125),
-
-        // Search parameters
-        search_nprobe: Some(128),
-        search_rng_epsilon: Some(8.0),
-        search_rng_factor: Some(1.0),
 
         // HNSW parameters
         ef_construction: Some(128),
@@ -149,6 +147,7 @@ async fn evaluate_recall(
     index: Arc<QuantizedSpannIndexWriter<USearchIndex>>,
     queries: &[Query],
     k: usize,
+    nprobe: usize,
     num_threads: usize,
     checkpoint_idx: usize,
     num_checkpoints: usize,
@@ -168,9 +167,10 @@ async fn evaluate_recall(
     progress.set_style(
         ProgressStyle::default_bar()
             .template(&format!(
-                "[CP {}/{} Recall] {{wide_bar}} {{pos}}/{{len}} [{{elapsed_precise}}<{{eta_precise}}]",
+                "[CP {}/{} Recall@{}] {{wide_bar}} {{pos}}/{{len}} [{{elapsed_precise}}<{{eta_precise}}]",
                 checkpoint_idx + 1,
-                num_checkpoints
+                num_checkpoints,
+                nprobe
             ))
             .unwrap(),
     );
@@ -189,7 +189,10 @@ async fn evaluate_recall(
                 let mut local_count: usize = 0;
 
                 for query in chunk {
-                    let results = index.search(k, &query.vector).await.expect("Search failed");
+                    let results = index
+                        .search(k, &query.vector, nprobe)
+                        .await
+                        .expect("Search failed");
                     local_recall_10_sum += recall_at_k(&results.keys, &query.neighbors, 10);
                     local_recall_100_sum += recall_at_k(&results.keys, &query.neighbors, 100);
                     local_count += 1;
@@ -236,24 +239,30 @@ async fn evaluate_recall(
 fn print_recall_summary(results: &[CheckpointResult]) {
     println!("\n=== Recall Summary ===");
     println!(
-        "| {:>3} | {:>8} | {:>8} | {:>8} | {:>7} | {:>6} | {:>6} |",
-        "CP", "Vectors", "Index", "Commit", "Queries", "R@10", "R@100"
+        "| {:>3} | {:>8} | {:>8} | {:>8} | {:>7} | {:^13} | {:^13} |",
+        "CP", "Vectors", "Index", "Commit", "Queries", "nprobe=64", "nprobe=128"
     );
     println!(
-        "|{:-^5}|{:-^10}|{:-^10}|{:-^10}|{:-^9}|{:-^8}|{:-^8}|",
+        "| {:>3} | {:>8} | {:>8} | {:>8} | {:>7} | {:>5}  {:>6} | {:>5}  {:>6} |",
+        "", "", "", "", "", "R@10", "R@100", "R@10", "R@100"
+    );
+    println!(
+        "|{:-^5}|{:-^10}|{:-^10}|{:-^10}|{:-^9}|{:-^15}|{:-^15}|",
         "", "", "", "", "", "", ""
     );
 
     for r in results {
         println!(
-            "| {:>3} | {:>8} | {:>8} | {:>8} | {:>7} | {:>6.4} | {:>6.4} |",
+            "| {:>3} | {:>8} | {:>8} | {:>8} | {:>7} | {:>6.4} {:>6.4} | {:>6.4} {:>6.4} |",
             r.checkpoint,
             format_count(r.vectors),
             format_duration(r.index_time),
             format_duration(r.commit_time),
             r.num_queries,
-            r.recall_10,
-            r.recall_100
+            r.recall_10_np64,
+            r.recall_100_np64,
+            r.recall_10_np128,
+            r.recall_100_np128
         );
     }
 }
@@ -282,6 +291,7 @@ async fn run() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         DatasetType::Arxiv => Box::new(Arxiv::load().await?),
         DatasetType::Sec => Box::new(Sec::load().await?),
         DatasetType::MsMarco => Box::new(MsMarco::load().await?),
+        DatasetType::WikipediaEn => Box::new(Wikipedia::load().await?),
     };
 
     let data_len = dataset.data_len();
@@ -542,63 +552,82 @@ async fn run() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
             .map(|v| v.as_slice())
             .unwrap_or(&[]);
 
-        let (recall_10, recall_100) = if !checkpoint_queries.is_empty() {
-            // Re-open index for search (need fresh providers)
-            let block_cache = new_cache_for_test();
-            let sparse_index_cache = new_cache_for_test();
-            let arrow_blockfile_provider = ArrowBlockfileProvider::new(
-                storage.clone(),
-                BLOCK_SIZE_BYTES,
-                block_cache,
-                sparse_index_cache,
-                16,
-            );
-            let blockfile_provider =
-                BlockfileProvider::ArrowBlockfileProvider(arrow_blockfile_provider);
+        let (recall_10_np64, recall_100_np64, recall_10_np128, recall_100_np128) =
+            if !checkpoint_queries.is_empty() {
+                // Re-open index for search (need fresh providers)
+                let block_cache = new_cache_for_test();
+                let sparse_index_cache = new_cache_for_test();
+                let arrow_blockfile_provider = ArrowBlockfileProvider::new(
+                    storage.clone(),
+                    BLOCK_SIZE_BYTES,
+                    block_cache,
+                    sparse_index_cache,
+                    16,
+                );
+                let blockfile_provider =
+                    BlockfileProvider::ArrowBlockfileProvider(arrow_blockfile_provider);
 
-            let usearch_cache = new_non_persistent_cache_for_test();
-            let usearch_provider = USearchIndexProvider::new(storage.clone(), usearch_cache);
+                let usearch_cache = new_non_persistent_cache_for_test();
+                let usearch_provider = USearchIndexProvider::new(storage.clone(), usearch_cache);
 
-            let raw_reader = blockfile_provider
-                .read::<u32, DataRecord<'static>>(BlockfileReaderOptions::new(
-                    raw_embedding_id.unwrap(),
+                let raw_reader = blockfile_provider
+                    .read::<u32, DataRecord<'static>>(BlockfileReaderOptions::new(
+                        raw_embedding_id.unwrap(),
+                        "".to_string(),
+                    ))
+                    .await
+                    .expect("Failed to open raw embedding reader");
+
+                let search_index = QuantizedSpannIndexWriter::<USearchIndex>::open(
+                    collection_id,
+                    config.clone(),
+                    dimension,
+                    distance_function.clone(),
+                    file_ids.clone().unwrap(),
+                    None,
                     "".to_string(),
-                ))
+                    Some(raw_reader),
+                    &blockfile_provider,
+                    &usearch_provider,
+                )
                 .await
-                .expect("Failed to open raw embedding reader");
+                .expect("Failed to open index for search");
 
-            let search_index = QuantizedSpannIndexWriter::<USearchIndex>::open(
-                collection_id,
-                config.clone(),
-                dimension,
-                distance_function.clone(),
-                file_ids.clone().unwrap(),
-                None,
-                "".to_string(),
-                Some(raw_reader),
-                &blockfile_provider,
-                &usearch_provider,
-            )
-            .await
-            .expect("Failed to open index for search");
+                let search_index = Arc::new(search_index);
 
-            evaluate_recall(
-                Arc::new(search_index),
-                checkpoint_queries,
-                k,
-                num_threads,
-                checkpoint_idx,
-                num_checkpoints,
-            )
-            .await
-        } else {
-            (0.0, 0.0)
-        };
+                // Evaluate with nprobe=64
+                let (r10_64, r100_64) = evaluate_recall(
+                    Arc::clone(&search_index),
+                    checkpoint_queries,
+                    k,
+                    64,
+                    num_threads,
+                    checkpoint_idx,
+                    num_checkpoints,
+                )
+                .await;
+
+                // Evaluate with nprobe=128
+                let (r10_128, r100_128) = evaluate_recall(
+                    search_index,
+                    checkpoint_queries,
+                    k,
+                    128,
+                    num_threads,
+                    checkpoint_idx,
+                    num_checkpoints,
+                )
+                .await;
+
+                (r10_64, r100_64, r10_128, r100_128)
+            } else {
+                (0.0, 0.0, 0.0, 0.0)
+            };
 
         let throughput = actual_count as f64 / index_time.as_secs_f64();
 
         println!(
-            "Checkpoint {}: {} vec | load {} | raw {} | index {} | commit {} | {:.0} vec/s | R@10: {:.4} R@100: {:.4}",
+            "Checkpoint {}: {} vec | load {} | raw {} | index {} | commit {} | {:.0} vec/s | np64: {:.4}/{:.4} np128: {:.4}/{:.4}",
             checkpoint_idx + 1,
             format_count(actual_count),
             format_duration(load_time),
@@ -606,8 +635,10 @@ async fn run() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
             format_duration(index_time),
             format_duration(commit_time),
             throughput,
-            recall_10,
-            recall_100
+            recall_10_np64,
+            recall_100_np64,
+            recall_10_np128,
+            recall_100_np128
         );
 
         checkpoint_results.push(CheckpointResult {
@@ -616,8 +647,10 @@ async fn run() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
             index_time,
             commit_time,
             num_queries: checkpoint_queries.len(),
-            recall_10,
-            recall_100,
+            recall_10_np64,
+            recall_100_np64,
+            recall_10_np128,
+            recall_100_np128,
         });
     }
 

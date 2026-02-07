@@ -12,7 +12,7 @@ use chroma_error::{ChromaError, ErrorCodes};
 use chroma_types::{
     default_center_drift_threshold, default_construction_ef_spann, default_m_spann,
     default_merge_threshold, default_nreplica_count, default_reassign_neighbor_count,
-    default_search_ef_spann, default_search_nprobe, default_split_threshold, default_write_nprobe,
+    default_search_ef_spann, default_split_threshold, default_write_nprobe,
     default_write_rng_epsilon, default_write_rng_factor, Cmek, CollectionUuid, DataRecord,
     QuantizedCluster, SpannIndexConfig,
 };
@@ -498,16 +498,16 @@ impl<I: VectorIndex> QuantizedSpannIndexWriter<I> {
         &self,
         k: usize,
         query: &[f32],
+        nprobe: usize,
     ) -> Result<SearchResult, QuantizedSpannError> {
         use std::collections::HashSet;
 
         let rotated = self.rotate(query);
 
         // Navigate: find nearest clusters using quantized centroid
-        let search_nprobe = self.config.search_nprobe.unwrap_or(default_search_nprobe()) as usize;
         let cluster_ids = self
             .quantized_centroid
-            .search(&rotated, search_nprobe)
+            .search(&rotated, nprobe)
             .map_err(|e| QuantizedSpannError::CentroidIndex(e.boxed()))?
             .keys;
 

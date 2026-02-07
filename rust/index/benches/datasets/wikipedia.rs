@@ -1,4 +1,4 @@
-//! MS MARCO v2 with Cohere embed-multilingual-v3 embeddings: ~138M vectors, 1024 dimensions.
+//! Wikipedia EN with Cohere embed-multilingual-v3 embeddings: ~41.5M vectors, 1024 dimensions.
 
 use std::fs::File;
 use std::io;
@@ -12,47 +12,47 @@ use parquet::arrow::arrow_reader::ParquetRecordBatchReaderBuilder;
 
 use super::{ground_truth, Dataset, Query};
 
-const REPO_ID: &str = "Cohere/msmarco-v2-embed-multilingual-v3";
-const NUM_SHARDS: usize = 139;
+const REPO_ID: &str = "Cohere/wikipedia-2023-11-embed-multilingual-v3";
+const NUM_SHARDS: usize = 415;
 pub const DIMENSION: usize = 1024;
-pub const DATA_LEN: usize = 138_364_198;
+pub const DATA_LEN: usize = 41_488_110;
 const COLUMN: &str = "emb";
 
 fn shard_files() -> Vec<String> {
     (0..NUM_SHARDS)
-        .map(|i| format!("corpus/{:04}.parquet", i))
+        .map(|i| format!("en/{:04}.parquet", i))
         .collect()
 }
 
 fn cache_dir() -> PathBuf {
     dirs::home_dir()
         .expect("failed to get home directory")
-        .join(".cache/msmarco_v2")
+        .join(".cache/wikipedia_en")
 }
 
 fn gt_path() -> PathBuf {
     cache_dir().join("ground_truth.parquet")
 }
 
-/// MS MARCO v2 dataset handle.
-pub struct MsMarco {
+/// Wikipedia EN dataset handle.
+pub struct Wikipedia {
     shard_paths: Vec<PathBuf>,
 }
 
-impl MsMarco {
-    /// Load MS MARCO v2 dataset from HuggingFace Hub.
-    /// Requires ground truth to be precomputed at ~/.cache/msmarco_v2/ground_truth.parquet
+impl Wikipedia {
+    /// Load Wikipedia EN dataset from HuggingFace Hub.
+    /// Requires ground truth to be precomputed at ~/.cache/wikipedia_en/ground_truth.parquet
     pub async fn load() -> io::Result<Self> {
         // Check ground truth exists before downloading shards
         if !ground_truth::exists(&gt_path()) {
             return Err(io::Error::other(format!(
                 "Ground truth not found at {}.\n  \
-                 Run: python sphroma/scripts/compute_ground_truth.py --dataset msmarco",
+                 Run: python sphroma/scripts/compute_ground_truth.py --dataset wikipedia",
                 gt_path().display()
             )));
         }
 
-        println!("Loading MS MARCO v2 from HuggingFace Hub...");
+        println!("Loading Wikipedia EN from HuggingFace Hub...");
 
         let api = hf_hub::api::tokio::Api::new().map_err(io::Error::other)?;
         let repo = api.dataset(REPO_ID.to_string());
@@ -171,9 +171,9 @@ impl MsMarco {
     }
 }
 
-impl Dataset for MsMarco {
+impl Dataset for Wikipedia {
     fn name(&self) -> &str {
-        "msmarco-v2"
+        "wikipedia-en"
     }
 
     fn dimension(&self) -> usize {
@@ -189,7 +189,7 @@ impl Dataset for MsMarco {
     }
 
     fn load_range(&self, offset: usize, limit: usize) -> io::Result<Vec<(u32, Arc<[f32]>)>> {
-        MsMarco::load_range(self, offset, limit)
+        Wikipedia::load_range(self, offset, limit)
     }
 
     fn queries(&self, distance_function: DistanceFunction) -> io::Result<Vec<Query>> {

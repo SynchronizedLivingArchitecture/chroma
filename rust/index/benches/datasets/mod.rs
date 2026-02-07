@@ -3,6 +3,7 @@ pub mod dbpedia;
 pub mod ground_truth;
 pub mod msmarco;
 pub mod sec;
+pub mod wikipedia;
 
 use std::collections::HashSet;
 use std::io;
@@ -22,6 +23,7 @@ pub enum DatasetType {
     Arxiv,
     Sec,
     MsMarco,
+    WikipediaEn,
 }
 
 // =============================================================================
